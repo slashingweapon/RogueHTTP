@@ -1,4 +1,4 @@
-I wrote this in response to a "code challenge" from a perspective employer.  I was supposed to write a socket server in the language of my choice in 24 hours.  I was also supposed to say what I would do differently if I had a little more time, and what else I would build if I had a lot more time.
+I wrote this in response to a code challenge.  I was supposed to write a socket server in the language of my choice in 24 hours.  I was also supposed to say what I would do differently if I had a little more time, and what else I would build if I had a lot more time.
 
 So, I happened to be driving a lot that day and had a lot of time to think about it.  About the time I got home, I had the bright idea of writing a mini web server for your iPhone.  Single-threaded, asynchronous, very light.  Everywhere you go, your server goes with you.  Naturally, I spent WAY too much time on it for people who aren't paying me, but it was fun and I didn't want to stop until I had something usable.  So now I'm up until the wee hours...
 
@@ -11,7 +11,7 @@ Right now it "works", but there's about a billion things wrong with the code.  O
 	* We're reading whole files into memory and then sending them.  Very bad for dealing with large files.
 	* There is no provision for getting rid of stalled connections
 	* Set a maximum number of connections.  Right now, the sky is the limit.
-	* Right now the SocketServer is a singleton.  It doesn't have to be that way.  You could have a factory method which created a server on a given address/port, and instantiated objects of a given classname for each connection.  As long as the given class implemented the StreamProtocolHandler protocol, it would work.
+	* Right now the SocketServer is a singleton.  It doesn't have to be that way.  You could have a factory method which created a server on a given address/port, and instantiated objects of a given classname for each connection.  As long as the given class implemented the right init selector, it would work.
 	
 Also, here's some features that would would be fun to implement:
 
