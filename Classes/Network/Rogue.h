@@ -10,10 +10,19 @@
 #import <CFNetwork/CFHTTPMessage.h>
 
 
+typedef enum {
+	RogueStateStartup,
+	RogueStateReceivingRequest,
+	RogueStateSendingResponse,
+	RogueStateShuttingDown
+} RogueState;
+
 @interface Rogue : NSObject {
+	RogueState state;
 	CFSocketRef socket;
 	CFHTTPMessageRef request;
 	NSFileManager *fileManager;
+	CFDataRef outputData;
 }
 
 - (id)initWithNativeSocket:(CFSocketNativeHandle)nativeSocket;

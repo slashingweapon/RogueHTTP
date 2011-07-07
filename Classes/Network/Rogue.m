@@ -8,6 +8,12 @@
 
 #import "Rogue.h"
 
+/*	This is the code that gets called by our run loop when something intereting happens to our socked.
+	We dereference the info pointer to our class pointer, and call an approprite method.
+ 
+	Note the toll-free bridging between CFDataRef and NSData.  You'll a lot off that here.  We're getting
+	closer to the OS than iOS programs usually need to.
+ */
 static void socketHandler (CFSocketRef socket, 
 						   CFSocketCallBackType callbackType, 
 						   CFDataRef address, 
@@ -46,6 +52,8 @@ static NSDictionary *mimeTypes = nil;
 - (id)initWithNativeSocket:(CFSocketNativeHandle)nativeSocket {
 	self = [super init];
 	if (self) {
+		state = RogueStateStartup;
+		
 		request = CFHTTPMessageCreateEmpty(kCFAllocatorDefault, TRUE);
 		
 		CFSocketContext ctx = { 0, self, 0, 0, 0 };
@@ -61,19 +69,25 @@ static NSDictionary *mimeTypes = nil;
 		CFRunLoopAddSource(CFRunLoopGetMain(), loopSource, kCFRunLoopCommonModes);
 		CFRelease(loopSource);
 		
-		[self retain];	// we own ourselves, which I'm not sure is kosher in iOS-land
+		state = RogueStateReceivingRequest;
+		[self retain];
 	}
 	
 	if (!mimeTypes)
 		mimeTypes  = [[NSDictionary dictionaryWithObjectsAndKeys:
-						@"text/plain", @"txt",
-						@"text/html", @"html",
-						@"text/html", @"htm",
-						@"image/jpeg", @"jpg",
-						@"image/jpeg", @"jpeg",
-						@"image/gif", @"gif",
-						@"image/tiff", @"tiff",
-						@"image/png", @"png",
+					   @"audio/mpeg", @"mp3",
+					   @"audio/vnd.wave", @"wav",
+					   @"application/javascript", @"js",
+					   @"application/pdf", @"pdf",
+					   @"text/plain", @"txt",
+					   @"text/html", @"html",
+					   @"text/html", @"htm",
+					   @"text/xml", @"xml",
+					   @"image/jpeg", @"jpg",
+					   @"image/jpeg", @"jpeg",
+					   @"image/gif", @"gif",
+					   @"image/tiff", @"tiff",
+					   @"image/png", @"png",
 						nil
 						] retain];
 	return self;
@@ -82,43 +96,54 @@ static NSDictionary *mimeTypes = nil;
 - (void)dealloc {
 	if (request)
 		CFRelease(request);
-	if (socket) {
+	if (socket)
 		CFRelease(socket);
-	}
 	if (fileManager)
 		[fileManager release];
+	if (outputData)
+		CFRelease(outputData);
+	
 	[super dealloc];
 }
 
-- (void)socket:(CFSocketRef)socket hasData:(NSData*)data {
-	CFHTTPMessageAppendBytes (request, [data bytes], [data length]);
-	if (CFHTTPMessageIsHeaderComplete (request))
-		[self processRequest];
+- (void)socket:(CFSocketRef)leSocket hasData:(NSData*)data {
+	if (state == RogueStateReceivingRequest) {
+		CFHTTPMessageAppendBytes (request, [data bytes], [data length]);
+		if (CFHTTPMessageIsHeaderComplete (request))
+			[self processRequest];
+	} else {
+		NSLog(@"Extra data on %d in state %d", CFSocketGetNative(leSocket), state);
+		NSString *huh = [[NSString alloc] initWithBytes:[data bytes] length:[data length] encoding:NSUTF8StringEncoding];
+		NSLog(@"%@", huh);
+		[huh release];
+	}
 }
 
-- (void)socket:(CFSocketRef)socket isWritable:(BOOL)writable {
-	// NSLog(@"Socket is writable");
+- (void)socket:(CFSocketRef)leSocket isWritable:(BOOL)writable {
+	NSLog(@"Socket %d is writable in state %d", CFSocketGetNative(leSocket), state);	
 }
 
-- (void)socket:(CFSocketRef)socket connectedWithError:(NSInteger)error {
-	// NSLog(@"Connect with code %d", error);
-	if (error != 0)
-		[self release];
+- (void)socket:(CFSocketRef)leSocket connectedWithError:(NSInteger)error {
+	if (error != 0) {
+		state = RogueStateShuttingDown;
+		CFSocketInvalidate(socket);
+		[self autorelease];
+	}
 }
 
 - (void)processRequest {
 	if (!fileManager)
-		fileManager = [[[NSFileManager alloc] init] autorelease];
+		fileManager = [[NSFileManager alloc] init];
 	
 	int code = 200;
 	BOOL isDir;
 	NSString *method = (NSString*) CFHTTPMessageCopyRequestMethod (request);
 	NSURL *url = (NSURL*) CFHTTPMessageCopyRequestURL (request);
+	NSLog(@"Socket %d wants %@", CFSocketGetNative(socket), [url path]);
 	
 	if ([method isEqualToString:@"GET"]) {
 		NSArray *searchPaths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
 		NSString *filePath = [[searchPaths objectAtIndex:0] stringByAppendingPathComponent:[url path]];
-		// NSLog(@"Looking at path %@", filePath);
 		
 		if ([fileManager fileExistsAtPath:filePath isDirectory:&isDir] && isDir)
 			filePath = [filePath stringByAppendingPathComponent:@"index.html"];
@@ -154,12 +179,22 @@ static NSDictionary *mimeTypes = nil;
 			
 			
 			CFHTTPMessageSetBody (response, (CFDataRef)data);
-			CFDataRef output = CFHTTPMessageCopySerializedMessage (response);
-			CFSocketSendData (socket, NULL, output, 100.0);
+			outputData = CFHTTPMessageCopySerializedMessage (response);
+
+			NSLog(@"Sending output to %d", CFSocketGetNative(socket));
+			state = RogueStateSendingResponse;
+			CFSocketEnableCallBacks(socket, kCFSocketWriteCallBack);
+			CFSocketError err = CFSocketSendData (socket, NULL, outputData, 100.0);
+			if (err)
+				NSLog(@"Socket %d error %d", CFSocketGetNative(socket), err);
+			
 			CFRelease(response);
 		}
 	}
+	
+	state = RogueStateShuttingDown;
 	CFSocketInvalidate(socket);
+	[self autorelease];
 }
 
 @end
