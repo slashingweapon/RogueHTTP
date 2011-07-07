@@ -1,18 +1,22 @@
 I wrote this in response to a "code challenge" from a perspective employer.  I was supposed to write a socket server in the language of my choice in 24 hours.  I was also supposed to say what I would do differently if I had a little more time, and what else I would build if I had a lot more time.
 
-So, I happened to be driving a lot that day and had a lot of time to think about it.  About the time I got home, I had the bright idea of writing a mini web server for your iPhone.  Everywhere you go, your server goes with you.  Naturally, I spent WAY too much time on it for people who aren't paying me, but it was fun and I didn't want to stop until I had something usable.
+So, I happened to be driving a lot that day and had a lot of time to think about it.  About the time I got home, I had the bright idea of writing a mini web server for your iPhone.  Single-threaded, asynchronous, very light.  Everywhere you go, your server goes with you.  Naturally, I spent WAY too much time on it for people who aren't paying me, but it was fun and I didn't want to stop until I had something usable.  So now I'm up until the wee hours...
 
 The idea is simple enough: With your phone plugged into iTunes, open the RogueHTTP Document folder on your iPhone and put whatever files you want into it.  When you want to share those files, just run the RogueHTTP application.  Of course, you need WiFi, and your IP address always changes.  But it's fun anyway!
 
-Of course, there's about a billion things wrong with the code.  One caffeine-driven night's output can only get you so far.  A few needs that come to mind:
+Right now it "works", but there's about a billion things wrong with the code.  One caffeine-driven night's output can only get you so far.  A few needs that come to mind:
 
+	* There's some tricky details about finishing off your asynchronous connection.  I'm leaking memory badly at the moment so I don't crash.  This is the first thing that has to be dealt with.
+	* We're only handling the GET method, and there's absolutely no feature support.
+	* We're reading whole files into memory and then sending them.  Very bad for dealing with large files.
 	* There is no provision for getting rid of stalled connections
 	* Set a maximum number of connections.  Right now, the sky is the limit.
-	* I really don't know much about Apple's HTTP protocol object internals.  It seems cool, but there's a ton of features (pipelined requests, chunked data, etc) that I have no idea if it supports.
-	* Right now the SocketServer is a singleton.  It doesn't have to be that way.  You could have a factory method which created a server on a given address/port, and instantiated objects of a given classname for each connection.  As long as the given class implemented the StreamProtocolHandler protocol, it would work!
+	* Right now the SocketServer is a singleton.  It doesn't have to be that way.  You could have a factory method which created a server on a given address/port, and instantiated objects of a given classname for each connection.  As long as the given class implemented the StreamProtocolHandler protocol, it would work.
 	
 Also, here's some features that would would be fun to implement:
 
+	* There needs to be a default site.
+	* You need a button you can push to connect Safari to your own Rogue site.
 	* Register the web server with Bonjour.
 	* Present a list of the other rogue servers near you.
 	* Tapping a server on the list should connect you with the other rogue servers.

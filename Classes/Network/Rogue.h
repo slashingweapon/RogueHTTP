@@ -13,7 +13,6 @@
 @interface Rogue : NSObject {
 	CFSocketRef socket;
 	CFHTTPMessageRef request;
-	CFHTTPMessageRef response;
 	NSFileManager *fileManager;
 }
 
