@@ -108,4 +108,14 @@
 }
 */
 
+- (IBAction)goToSite:(id)sender {
+	SocketServer *server = [SocketServer singleton];
+	
+	NSString *urlString = [NSString stringWithFormat:@"http://localhost:%d/",
+						   [server.port integerValue]];
+	NSURL *url = [NSURL URLWithString:urlString];
+	
+	[[UIApplication sharedApplication] openURL:url];
+}
+
 @end

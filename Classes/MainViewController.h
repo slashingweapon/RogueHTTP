@@ -13,5 +13,6 @@
 }
 
 - (IBAction)showInfo:(id)sender;
+- (IBAction)goToSite:(id)sender;
 
 @end
