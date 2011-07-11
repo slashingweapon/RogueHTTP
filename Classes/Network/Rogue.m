@@ -8,68 +8,44 @@
 
 #import "Rogue.h"
 
-/*	This is the code that gets called by our run loop when something intereting happens to our socked.
-	We dereference the info pointer to our class pointer, and call an approprite method.
- 
-	Note the toll-free bridging between CFDataRef and NSData.  You'll a lot off that here.  We're getting
-	closer to the OS than iOS programs usually need to.
- */
-static void socketHandler (CFSocketRef socket, 
-						   CFSocketCallBackType callbackType, 
-						   CFDataRef address, 
-						   const void *data, 
-						   void *info) 
-{
-	CFSocketContext ctx;
-	int code = 0;
-	Rogue *rogue = (Rogue*) info;
-	
-	CFSocketGetContext(socket, &ctx);
-	
-	if ([rogue isKindOfClass:[Rogue class]]) {
-		switch (callbackType) {
-			case kCFSocketDataCallBack:
-				[rogue socket:socket hasData:(NSData*)data];
-				break;
-			case kCFSocketConnectCallBack:
-				if (data != NULL)
-					code = *((int*)data);
-				break;
-			case kCFSocketWriteCallBack:
-				[rogue socket:socket isWritable:YES];
-				break;
-			default:
-				NSLog(@"Unexpected callback %d", callbackType);
-				break;
-		}
-	}
-}
-
 static NSDictionary *mimeTypes = nil;
 
 @implementation Rogue
 
+/*	Take a BSD socket handle and use it to initialize a Rogue server. */
+
 - (id)initWithNativeSocket:(CFSocketNativeHandle)nativeSocket {
+	CFReadStreamRef	readStream = nil;
+	CFWriteStreamRef writeStream = nil;
+	
 	self = [super init];
 	if (self) {
 		state = RogueStateStartup;
 		
 		request = CFHTTPMessageCreateEmpty(kCFAllocatorDefault, TRUE);
 		
-		CFSocketContext ctx = { 0, self, 0, 0, 0 };
-
-		socket = CFSocketCreateWithNative (
-					kCFAllocatorDefault,
-					nativeSocket,
-					kCFSocketDataCallBack|kCFSocketConnectCallBack|kCFSocketWriteCallBack,
-					socketHandler,
-					&ctx
-				);
-		CFRunLoopSourceRef loopSource = CFSocketCreateRunLoopSource(kCFAllocatorDefault, socket, 0);
-		CFRunLoopAddSource(CFRunLoopGetMain(), loopSource, kCFRunLoopCommonModes);
-		CFRelease(loopSource);
+		/*	NSStream doesn't support creation from sockets.  But CFStream does, and you get
+			toll-free bridging between the CFStream classes and their NSStream counterparts.
+		 */
+		CFStreamCreatePairWithSocket (kCFAllocatorDefault, nativeSocket, &readStream, &writeStream);
+		if (readStream && writeStream) {
+			netInStream = (NSInputStream*) readStream;
+			[netInStream setProperty:NSStreamNetworkServiceTypeVoIP forKey:NSStreamNetworkServiceType];
+			[netInStream setDelegate:self];
+			[netInStream scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+			[netInStream open];
+			
+			netOutStream = (NSOutputStream*) writeStream;
+			[netOutStream setProperty:NSStreamNetworkServiceTypeVoIP forKey:NSStreamNetworkServiceType];
+			[netOutStream setDelegate:self];
+			[netOutStream scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+			[netOutStream open];
+			
+			state = RogueStateReceiveRequestHeader;
+		} else {
+			state = RogueStateShutDown;
+		}
 		
-		state = RogueStateReceivingRequest;
 		[self retain];
 	}
 	
@@ -90,111 +66,283 @@ static NSDictionary *mimeTypes = nil;
 					   @"image/png", @"png",
 						nil
 						] retain];
+
 	return self;
 }
 
 - (void)dealloc {
 	if (request)
 		CFRelease(request);
-	if (socket)
-		CFRelease(socket);
-	if (fileManager)
-		[fileManager release];
-	if (outputData)
-		CFRelease(outputData);
+	
+	[netInStream close];
+	[netInStream removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+	[netInStream release];
+	
+	[netOutStream close];
+	[netOutStream removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+	[netOutStream release];
 	
 	[super dealloc];
 }
 
-- (void)socket:(CFSocketRef)leSocket hasData:(NSData*)data {
-	if (state == RogueStateReceivingRequest) {
-		CFHTTPMessageAppendBytes (request, [data bytes], [data length]);
-		if (CFHTTPMessageIsHeaderComplete (request))
-			[self processRequest];
-	} else {
-		NSLog(@"Extra data on %d in state %d", CFSocketGetNative(leSocket), state);
-		NSString *huh = [[NSString alloc] initWithBytes:[data bytes] length:[data length] encoding:NSUTF8StringEncoding];
-		NSLog(@"%@", huh);
-		[huh release];
+/*	All of our async IO events end up here.  We'll fill up our buffers, and then call
+	processRequest.
+ */
+- (void)stream:(NSStream *)theStream handleEvent:(NSStreamEvent)theEvent {
+	if (theEvent &  NSStreamEventOpenCompleted) {
+		NSLog(@"Unexpected connection event");
 	}
-}
-
-- (void)socket:(CFSocketRef)leSocket isWritable:(BOOL)writable {
-	NSLog(@"Socket %d is writable in state %d", CFSocketGetNative(leSocket), state);	
-}
-
-- (void)socket:(CFSocketRef)leSocket connectedWithError:(NSInteger)error {
-	if (error != 0) {
-		state = RogueStateShuttingDown;
-		CFSocketInvalidate(socket);
-		[self autorelease];
-	}
-}
-
-- (void)processRequest {
-	if (!fileManager)
-		fileManager = [[NSFileManager alloc] init];
 	
-	int code = 200;
-	BOOL isDir;
+	if (theEvent & NSStreamEventHasBytesAvailable) {
+		if (theStream == netInStream) {
+			netInReady = YES;
+		} else if (theStream == fileInStream) {
+			fileInReady = YES;
+		}
+	}
+	
+	if (theEvent & NSStreamEventHasSpaceAvailable) {
+		if (theStream == netOutStream)
+			netOutReady = YES;
+	}
+	
+	if (theEvent & NSStreamEventErrorOccurred) {
+		state = RogueStateStreamError;
+	}
+	
+	if (theEvent & NSStreamEventEndEncountered) {
+		if (theStream == netInStream) {
+			[netInStream close];
+			[netInStream removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+			[netInStream release];
+			netInStream = nil;
+		}
+		// we actually deal with this in our process loop
+	}
+	
+	[self advanceState];
+}
+
+/*	Each time we go through this function, we get as far as we can with the data we have, and then
+	we return.
+ */
+- (void) advanceState {
+	BOOL keepGoing;
+	uint8_t buffer[ROGUE_BUFFER_SIZE];
+	NSUInteger length;
+	int streamStatus;
+	
+	do {
+		keepGoing = NO;
+		
+		/*	Consume everything in the buffer and put it into our HTTP message object.
+			When the object says it has a complete header, we can transition to a new state.
+		 */
+		if (state == RogueStateReceiveRequestHeader) {	
+			if (netInStream) {
+				if ([netInStream hasBytesAvailable]) {
+					uint8_t *tempBuf;
+					NSUInteger tempBufLength;
+					
+					if ( [netInStream getBuffer:&tempBuf length:&tempBufLength]) {
+						if (tempBufLength > ROGUE_BUFFER_SIZE) 
+							tempBufLength = ROGUE_BUFFER_SIZE;
+						while ( (length = [netInStream read:buffer maxLength:tempBufLength]) > 0) {
+							if (CFHTTPMessageAppendBytes(request, buffer, length)) {
+								if (CFHTTPMessageIsHeaderComplete(request))
+									state = RogueStateProcessRequest;
+							} else
+								state = RogueStateShutDown;
+						}
+					}
+				} else {
+					streamStatus = [netInStream streamStatus];
+					switch ([netInStream streamStatus]) {
+						case NSStreamStatusClosed:
+						case NSStreamStatusError:
+							state = RogueStateShutDown;
+					}			
+				}
+			} else
+				state = RogueStateShutDown;			
+		}
+		
+		if (state == RogueStateReceiveRequestBody) {
+			/*	We're not enabling this yet.  Doing so will require a different parser,
+				implementation of chunked-encoding, and a probably a bunch of other stuff.
+			 */
+		}
+		
+		/*	This state requires a completed request.  We fill out all the particulars,
+			generate output streams for the header and body, then change the state
+		 */
+		if (state == RogueStateProcessRequest) {
+			[self processRequest];
+			state = RogueStateSendResponseHeader;
+		}
+		
+		/*	This state requires the headerInStream be present and available. */
+		if (state == RogueStateSendResponseHeader) {
+			if ([netOutStream hasSpaceAvailable] && [headerInStream hasBytesAvailable]) {
+				if ( (length = [headerInStream read:buffer maxLength:length]) > 0) {
+					length = [netOutStream write:buffer maxLength:length];
+				} else {
+					state = RogueStateSendResponseBody;
+				}
+			} else {
+				/*	We got an event, but apparently we aren't ready.  Check the status of our
+					header and network streams.  If the header stream is missing, closed, or err'ed out,
+					then we'll just proceed to handling the body.
+				 
+					If the output stream is missing or err'ed out, then we're going to shut down.
+				 */
+				if (headerInStream) {
+					streamStatus = [headerInStream streamStatus];
+					if (streamStatus == NSStreamStatusClosed || streamStatus == NSStreamStatusError)
+						state = RogueStateSendResponseBody;
+				} else
+					state = RogueStateSendResponseBody;
+
+				if (netOutStream) {
+					streamStatus = [netOutStream streamStatus];
+					if (streamStatus == NSStreamStatusClosed || streamStatus == NSStreamStatusError)
+						state = RogueStateShutDown;					
+				} else
+					state = RogueStateShutDown;
+			}
+			
+		}
+		
+		/*	This is pretty much just like sending the response header, but with a different stream. */
+		if (state == RogueStateSendResponseBody) {
+			if (netOutStream && [netOutStream hasSpaceAvailable]
+				&& fileInStream && [fileInStream hasBytesAvailable]) {
+			
+				if ( (length = [fileInStream read:buffer maxLength:length]) > 0) {
+					length = [netOutStream write:buffer maxLength:length];
+				}
+			} else {
+				// I know this looks like a call-after-check error, but messages sent to nil return 0.
+				streamStatus = [fileInStream streamStatus];
+				if (!fileInStream || streamStatus==NSStreamStatusClosed || streamStatus==NSStreamStatusError)
+					state = RogueStateShutDown;
+				
+				streamStatus = [netOutStream streamStatus];
+				if (!netOutStream || streamStatus==NSStreamStatusClosed || streamStatus==NSStreamStatusError)
+					state = RogueStateShutDown;
+			}
+		}
+		
+		if (state == RogueStateStreamError) {
+			NSLog(@"Stream error");
+			state = RogueStateShutDown;
+		}
+		
+		if (state == RogueStateShutDown) {
+			[self autorelease];
+			state = RogueStatePostShutdown;
+		}
+		
+		if (state == RogueStatePostShutdown) {
+			// do nothing.  The event will just pass us on by.
+			// At this point, we're waiting for the event loop to empty the autorelease pool, which
+			// will cause deallocation, which in turn will remove the stream events from the run loop.
+		}
+		
+	} while(keepGoing);
+}
+
+/*	Assumes we have a valid request header.
+ 
+	Produces a response header output buffer, and optionally a body output buffer.
+ */
+- (void)processRequest {
+	NSFileManager *fileManager = [[[NSFileManager alloc] init] autorelease];
+	NSString *filePath;
+	NSString *contentType;
+	int contentLength;
+	int responseCode = 200;
+	NSString *respText;
+
 	NSString *method = (NSString*) CFHTTPMessageCopyRequestMethod (request);
 	NSURL *url = (NSURL*) CFHTTPMessageCopyRequestURL (request);
-	NSLog(@"Socket %d wants %@", CFSocketGetNative(socket), [url path]);
+
+	if (! ([method isEqualToString:@"GET"] || [method isEqualToString:@"HEAD"]) ) {
+		responseCode = 405;
+		respText = @"MethodNotSupported";
+		contentType = @"text/plain";
+		fileInStream = [[NSInputStream alloc] initWithData:[NSData dataWithBytes:"Method not supported" length:20]];;
+		contentLength = 20;
+	}
 	
-	if ([method isEqualToString:@"GET"]) {
+	// Find the file corresponding to the URL
+	if (responseCode/200 == 2) {
+		BOOL isDir;
+
 		NSArray *searchPaths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-		NSString *filePath = [[searchPaths objectAtIndex:0] stringByAppendingPathComponent:[url path]];
+		filePath = [[searchPaths objectAtIndex:0] stringByAppendingPathComponent:[url path]];
 		
 		if ([fileManager fileExistsAtPath:filePath isDirectory:&isDir] && isDir)
 			filePath = [filePath stringByAppendingPathComponent:@"index.html"];
 		
-		NSData *data = [fileManager contentsAtPath:filePath];
-		if (!data) {
-			code = 400;
-			data = [NSData dataWithBytes:"file not found" length:14];
-		}
-		
-		if (data) {
-			CFHTTPMessageRef response = CFHTTPMessageCreateResponse (kCFAllocatorDefault, code, (CFStringRef)@"OK", kCFHTTPVersion1_0);
-			NSString *type = [mimeTypes valueForKey:[filePath pathExtension]];
-			if (!type)
-				type = @"text/html";
-
-			CFHTTPMessageSetHeaderFieldValue(response, (CFStringRef)@"Content-Type", (CFStringRef) type);
-			CFHTTPMessageSetHeaderFieldValue(response, (CFStringRef)@"Content-Length", (CFStringRef)[NSString stringWithFormat:@"%ld",[data length]]);
-			CFHTTPMessageSetHeaderFieldValue(response, (CFStringRef)@"Location", (CFStringRef) [url path]);
-
-			// Sun, 06 Nov 1994 08:49:37 GMT
-			time_t now = time(NULL);
-			struct tm timeptr;
-			char rawstring[64];
-			gmtime_r(&now, &timeptr);
-			long len = strftime(rawstring, 64, "%a, %d %b %Y %H:%M:%S %Z", &timeptr);
-			if (len>0)
-				CFHTTPMessageSetHeaderFieldValue(response, (CFStringRef)@"Date", 
-												 (CFStringRef)[NSString stringWithCString:rawstring encoding:NSASCIIStringEncoding]);
-			
-			CFHTTPMessageSetHeaderFieldValue(response, (CFStringRef)@"Server", 
-											 (CFStringRef)@"RogueHTTP/0.1");
-			
-			
-			CFHTTPMessageSetBody (response, (CFDataRef)data);
-			outputData = CFHTTPMessageCopySerializedMessage (response);
-
-			NSLog(@"Sending output to %d", CFSocketGetNative(socket));
-			state = RogueStateSendingResponse;
-			CFSocketEnableCallBacks(socket, kCFSocketWriteCallBack);
-			CFSocketError err = CFSocketSendData (socket, NULL, outputData, 100.0);
-			if (err)
-				NSLog(@"Socket %d error %d", CFSocketGetNative(socket), err);
-			
-			CFRelease(response);
+		if ( (fileInStream = [[NSInputStream alloc] initWithFileAtPath:filePath]) ) {
+			respText = @"OK";
+			contentType = [mimeTypes valueForKey:[filePath pathExtension]];
+			[[[fileManager attributesOfItemAtPath:filePath error:nil] valueForKey:NSFileSize] integerValue];
+		} else {
+			responseCode = 404;
+			respText = @"FileNotFound";
+			contentType = @"text/plain";
+			fileInStream = [[NSInputStream alloc] initWithData:[NSData dataWithBytes:"File not found" length:14]];
+			contentLength = 14;
 		}
 	}
 	
-	state = RogueStateShuttingDown;
-	CFSocketInvalidate(socket);
-	[self autorelease];
+	// Check lastmod date.  (Not Implemented)
+	if (responseCode/200 == 2) {
+		NSString *imsDate = (NSString*) CFHTTPMessageCopyHeaderFieldValue(request, (CFStringRef)@"if-modified-since");
+		
+		[imsDate release];
+	}
+	
+	// create the response
+	CFHTTPMessageRef response = CFHTTPMessageCreateResponse (kCFAllocatorDefault, responseCode, (CFStringRef)respText, kCFHTTPVersion1_0);
+	CFHTTPMessageSetHeaderFieldValue(response, (CFStringRef)@"Content-Type", (CFStringRef) contentType);
+	CFHTTPMessageSetHeaderFieldValue(response, (CFStringRef)@"Content-Length", (CFStringRef)[NSString stringWithFormat:@"%ld",contentLength]);
+	CFHTTPMessageSetHeaderFieldValue(response, (CFStringRef)@"Location", (CFStringRef) [url path]);
+	
+	// Sun, 06 Nov 1994 08:49:37 GMT
+	time_t now = time(NULL);
+	struct tm timeptr;
+	char rawstring[64];
+	gmtime_r(&now, &timeptr);
+	long len = strftime(rawstring, 64, "%a, %d %b %Y %H:%M:%S %Z", &timeptr);
+	if (len>0)
+		CFHTTPMessageSetHeaderFieldValue(response, (CFStringRef)@"Date", 
+										 (CFStringRef)[NSString stringWithCString:rawstring encoding:NSASCIIStringEncoding]);
+	
+	CFHTTPMessageSetHeaderFieldValue(response, (CFStringRef)@"Server", (CFStringRef)@"RogueHTTP/0.1");
+	
+	NSData *outputData = (NSData*) CFHTTPMessageCopySerializedMessage (response);
+	if (outputData) {
+		headerInStream = [[NSInputStream alloc] initWithData:outputData];
+		state = RogueStateSendResponseHeader;
+	} else {
+		NSLog(@"Unable to build header.");
+		state = RogueStateShutDown;
+	}
+	
+	if (headerInStream) {
+		[headerInStream setDelegate:self];
+		[headerInStream scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+		[headerInStream open];
+	}
+	
+	if (fileInStream) {
+		[fileInStream setDelegate:self];
+		[fileInStream scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+		[fileInStream open];
+	}		
 }
 
 @end

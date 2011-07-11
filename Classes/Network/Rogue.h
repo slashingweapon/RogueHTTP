@@ -10,25 +10,43 @@
 #import <CFNetwork/CFHTTPMessage.h>
 
 
+#define ROGUE_BUFFER_SIZE 4098
+
 typedef enum {
 	RogueStateStartup,
-	RogueStateReceivingRequest,
-	RogueStateSendingResponse,
-	RogueStateShuttingDown
+	RogueStateReceiveRequestHeader,
+	RogueStateReceiveRequestBody,
+	RogueStateProcessRequest,
+	RogueStateSendResponseHeader,
+	RogueStateSendResponseBody,
+	RogueStateStreamError,
+	RogueStateShutDown,
+	RogueStatePostShutdown
 } RogueState;
 
-@interface Rogue : NSObject {
+@interface Rogue : NSObject <NSStreamDelegate> {
 	RogueState state;
-	CFSocketRef socket;
 	CFHTTPMessageRef request;
-	NSFileManager *fileManager;
-	CFDataRef outputData;
+
+	NSInputStream *netInStream;
+	NSData *netInBuffer;
+	BOOL netInReady;
+	
+	NSInputStream *headerInStream;
+	BOOL headerInReady;
+	
+	NSInputStream *fileInStream;
+	NSData *fileInBuffer;
+	BOOL fileInReady;
+	NSUInteger fileInOffset;
+	
+	NSOutputStream *netOutStream;
+	BOOL netOutReady;
 }
 
 - (id)initWithNativeSocket:(CFSocketNativeHandle)nativeSocket;
-- (void)socket:(CFSocketRef)socket hasData:(NSData*)data;
-- (void)socket:(CFSocketRef)socket isWritable:(BOOL)writable;
-- (void)socket:(CFSocketRef)socket connectedWithError:(NSInteger)error;
+
+- (void)advanceState;
 - (void)processRequest;
 
 @end
