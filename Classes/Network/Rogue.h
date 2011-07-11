@@ -25,6 +25,8 @@ typedef enum {
 } RogueState;
 
 @interface Rogue : NSObject <NSStreamDelegate> {
+	CFSocketNativeHandle sockHandle;
+	
 	RogueState state;
 	CFHTTPMessageRef request;
 
@@ -45,7 +47,7 @@ typedef enum {
 }
 
 - (id)initWithNativeSocket:(CFSocketNativeHandle)nativeSocket;
-
+- (void)closeStream:(NSStream **)targetStream;
 - (void)advanceState;
 - (void)processRequest;
 

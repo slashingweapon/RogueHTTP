@@ -20,6 +20,8 @@ static NSDictionary *mimeTypes = nil;
 	
 	self = [super init];
 	if (self) {
+		sockHandle = nativeSocket;
+		
 		state = RogueStateStartup;
 		
 		request = CFHTTPMessageCreateEmpty(kCFAllocatorDefault, TRUE);
@@ -74,24 +76,68 @@ static NSDictionary *mimeTypes = nil;
 	if (request)
 		CFRelease(request);
 	
-	[netInStream close];
-	[netInStream removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
-	[netInStream release];
+	[self closeStream:&netInStream];
+	[self closeStream:&netOutStream];
+	[self closeStream:&headerInStream];
+	[self closeStream:&fileInStream];
 	
-	[netOutStream close];
-	[netOutStream removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
-	[netOutStream release];
-	
+	/*	This took me a long time to figure out, and it isn't in any of Apple's documentation.
+		When you build an NSStream from a socket, closing the stream doesn't close the socket.
+		You need to close it separately, IMLE.
+	 */
+	close(sockHandle);
+		
 	[super dealloc];
+}
+
+- (void)closeStream:(NSStream **)targetStream {
+	NSStream *theStream = *targetStream;
+	if (theStream) {
+		[theStream close];
+		[theStream removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+		[theStream release];
+		*targetStream = nil;
+	}
 }
 
 /*	All of our async IO events end up here.  We'll fill up our buffers, and then call
 	processRequest.
  */
 - (void)stream:(NSStream *)theStream handleEvent:(NSStreamEvent)theEvent {
-	if (theEvent &  NSStreamEventOpenCompleted) {
-		NSLog(@"Unexpected connection event");
+	NSString *whichStream;
+	NSString *whichEvent;
+	
+	if (theStream == netInStream)
+		whichStream = @"netInStream";
+	else if (theStream == netOutStream)
+		whichStream = @"netOutStream";
+	else if (theStream == headerInStream)
+		whichStream = @"headerInStream";
+	else if (theStream == fileInStream)
+		whichStream = @"fileInStream";
+	
+	switch (theEvent) {
+		case NSStreamEventOpenCompleted:
+			whichEvent = @"open";
+			break;
+		case NSStreamEventHasBytesAvailable:
+			whichEvent = @"bytesAvailable";
+			break;
+		case NSStreamEventHasSpaceAvailable:
+			whichEvent = @"spaceAvailable";
+			break;
+		case NSStreamEventErrorOccurred:
+			whichEvent = @"error";
+			break;
+		case NSStreamEventEndEncountered:
+			whichEvent = @"end-of-file";
+			break;
+		default:
+			whichEvent = [NSString stringWithFormat:@"unknown(%d)", theEvent];
+			break;
 	}
+
+	NSLog(@"Stream %p %d %@ %@", self, state, whichStream, whichEvent);
 	
 	if (theEvent & NSStreamEventHasBytesAvailable) {
 		if (theStream == netInStream) {
@@ -107,17 +153,22 @@ static NSDictionary *mimeTypes = nil;
 	}
 	
 	if (theEvent & NSStreamEventErrorOccurred) {
-		state = RogueStateStreamError;
+		NSError *error = [theStream streamError];
+		NSLog(@"%@ error %@", whichStream, [error localizedDescription]);
+		// if we're already in shutdown mode or greater, don't try to go backwards!
+		if (state < RogueStateStreamError)
+			state = RogueStateStreamError;
 	}
 	
-	if (theEvent & NSStreamEventEndEncountered) {
-		if (theStream == netInStream) {
-			[netInStream close];
-			[netInStream removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
-			[netInStream release];
-			netInStream = nil;
-		}
-		// we actually deal with this in our process loop
+	if (theEvent & (NSStreamEventEndEncountered|NSStreamEventErrorOccurred)) {
+		if (theStream == netInStream)
+			[self closeStream:&netInStream];
+		else if (theStream == netOutStream)
+			[self closeStream:&netOutStream];
+		else if (theStream == headerInStream)
+			[self closeStream:&headerInStream];
+		else if (theStream == fileInStream)
+			[self closeStream:&fileInStream];
 	}
 	
 	[self advanceState];
@@ -127,129 +178,121 @@ static NSDictionary *mimeTypes = nil;
 	we return.
  */
 - (void) advanceState {
-	BOOL keepGoing;
 	uint8_t buffer[ROGUE_BUFFER_SIZE];
-	NSUInteger length;
+	int length;
 	int streamStatus;
 	
-	do {
-		keepGoing = NO;
 		
-		/*	Consume everything in the buffer and put it into our HTTP message object.
-			When the object says it has a complete header, we can transition to a new state.
-		 */
-		if (state == RogueStateReceiveRequestHeader) {	
-			if (netInStream) {
-				if ([netInStream hasBytesAvailable]) {
-					uint8_t *tempBuf;
-					NSUInteger tempBufLength;
-					
-					if ( [netInStream getBuffer:&tempBuf length:&tempBufLength]) {
-						if (tempBufLength > ROGUE_BUFFER_SIZE) 
-							tempBufLength = ROGUE_BUFFER_SIZE;
-						while ( (length = [netInStream read:buffer maxLength:tempBufLength]) > 0) {
-							if (CFHTTPMessageAppendBytes(request, buffer, length)) {
-								if (CFHTTPMessageIsHeaderComplete(request))
-									state = RogueStateProcessRequest;
-							} else
-								state = RogueStateShutDown;
-						}
-					}
-				} else {
-					streamStatus = [netInStream streamStatus];
-					switch ([netInStream streamStatus]) {
-						case NSStreamStatusClosed:
-						case NSStreamStatusError:
-							state = RogueStateShutDown;
-					}			
+	/*	Consume everything in the buffer and put it into our HTTP message object.
+		When the object says it has a complete header, we can transition to a new state.
+	 */
+	if (state == RogueStateReceiveRequestHeader) {	
+		if (netInStream) {
+			if ([netInStream hasBytesAvailable]) {					
+				if ( (length = [netInStream read:buffer maxLength:ROGUE_BUFFER_SIZE]) > 0) {
+					if (CFHTTPMessageAppendBytes(request, buffer, length)) {
+						if (CFHTTPMessageIsHeaderComplete(request))
+							state = RogueStateProcessRequest;
+					} else
+						state = RogueStateShutDown;
 				}
-			} else
-				state = RogueStateShutDown;			
-		}
-		
-		if (state == RogueStateReceiveRequestBody) {
-			/*	We're not enabling this yet.  Doing so will require a different parser,
-				implementation of chunked-encoding, and a probably a bunch of other stuff.
+			} else {
+				streamStatus = [netInStream streamStatus];
+				switch ([netInStream streamStatus]) {
+					case NSStreamStatusClosed:
+					case NSStreamStatusError:
+						state = RogueStateShutDown;
+				}			
+			}
+		} else
+			state = RogueStateShutDown;			
+	}
+	
+	if (state == RogueStateReceiveRequestBody) {
+		/*	We're not enabling this yet.  Doing so will require a different parser,
+			implementation of chunked-encoding, and a probably a bunch of other stuff.
+		 */
+	}
+	
+	/*	This state requires a completed request.  We fill out all the particulars,
+		generate output streams for the header and body, then change the state
+	 */
+	if (state == RogueStateProcessRequest) {
+		[self processRequest];
+		state = RogueStateSendResponseHeader;
+	}
+	
+	/*	This state requires the headerInStream be present and available. */
+	if (state == RogueStateSendResponseHeader) {
+		if ([netOutStream hasSpaceAvailable] && [headerInStream hasBytesAvailable]) {
+			if ( (length = [headerInStream read:buffer maxLength:length]) > 0) {
+				length = [netOutStream write:buffer maxLength:length];
+			} else {
+				state = RogueStateSendResponseBody;
+			}
+		} else {
+			/*	We got an event, but apparently we aren't ready.  Check the status of our
+				header and network streams.  If the header stream is missing, closed, or err'ed out,
+				then we'll just proceed to handling the body.
+			 
+				If the output stream is missing or err'ed out, then we're going to shut down.
 			 */
-		}
-		
-		/*	This state requires a completed request.  We fill out all the particulars,
-			generate output streams for the header and body, then change the state
-		 */
-		if (state == RogueStateProcessRequest) {
-			[self processRequest];
-			state = RogueStateSendResponseHeader;
-		}
-		
-		/*	This state requires the headerInStream be present and available. */
-		if (state == RogueStateSendResponseHeader) {
-			if ([netOutStream hasSpaceAvailable] && [headerInStream hasBytesAvailable]) {
-				if ( (length = [headerInStream read:buffer maxLength:length]) > 0) {
-					length = [netOutStream write:buffer maxLength:length];
-				} else {
+			if (headerInStream) {
+				streamStatus = [headerInStream streamStatus];
+				if (streamStatus == NSStreamStatusClosed || streamStatus == NSStreamStatusError)
 					state = RogueStateSendResponseBody;
-				}
-			} else {
-				/*	We got an event, but apparently we aren't ready.  Check the status of our
-					header and network streams.  If the header stream is missing, closed, or err'ed out,
-					then we'll just proceed to handling the body.
-				 
-					If the output stream is missing or err'ed out, then we're going to shut down.
-				 */
-				if (headerInStream) {
-					streamStatus = [headerInStream streamStatus];
-					if (streamStatus == NSStreamStatusClosed || streamStatus == NSStreamStatusError)
-						state = RogueStateSendResponseBody;
-				} else
-					state = RogueStateSendResponseBody;
+			} else
+				state = RogueStateSendResponseBody;
 
-				if (netOutStream) {
-					streamStatus = [netOutStream streamStatus];
-					if (streamStatus == NSStreamStatusClosed || streamStatus == NSStreamStatusError)
-						state = RogueStateShutDown;					
-				} else
-					state = RogueStateShutDown;
-			}
-			
-		}
-		
-		/*	This is pretty much just like sending the response header, but with a different stream. */
-		if (state == RogueStateSendResponseBody) {
-			if (netOutStream && [netOutStream hasSpaceAvailable]
-				&& fileInStream && [fileInStream hasBytesAvailable]) {
-			
-				if ( (length = [fileInStream read:buffer maxLength:length]) > 0) {
-					length = [netOutStream write:buffer maxLength:length];
-				}
-			} else {
-				// I know this looks like a call-after-check error, but messages sent to nil return 0.
-				streamStatus = [fileInStream streamStatus];
-				if (!fileInStream || streamStatus==NSStreamStatusClosed || streamStatus==NSStreamStatusError)
-					state = RogueStateShutDown;
-				
+			if (netOutStream) {
 				streamStatus = [netOutStream streamStatus];
-				if (!netOutStream || streamStatus==NSStreamStatusClosed || streamStatus==NSStreamStatusError)
-					state = RogueStateShutDown;
+				if (streamStatus == NSStreamStatusClosed || streamStatus == NSStreamStatusError)
+					state = RogueStateShutDown;					
+			} else
+				state = RogueStateShutDown;
+		}
+		
+	}
+	
+	/*	This is pretty much just like sending the response header, but with a different stream. */
+	if (state == RogueStateSendResponseBody) {
+		if (netOutStream && [netOutStream hasSpaceAvailable]
+			&& fileInStream && [fileInStream hasBytesAvailable]) {
+		
+			if ( (length = [fileInStream read:buffer maxLength:length]) > 0) {
+				length = [netOutStream write:buffer maxLength:length];
 			}
+		} else {
+			// I know this looks like a call-after-check error, but messages sent to nil return 0.
+			streamStatus = [fileInStream streamStatus];
+			if (!fileInStream || streamStatus==NSStreamStatusClosed || streamStatus==NSStreamStatusError)
+				state = RogueStateShutDown;
+			
+			streamStatus = [netOutStream streamStatus];
+			if (!netOutStream || streamStatus==NSStreamStatusClosed || streamStatus==NSStreamStatusError)
+				state = RogueStateShutDown;
+		}
+	}
+	
+	// Time to shut it down
+	if (state == RogueStateShutDown) {
+
+		// suck all the available data, or else sometimes the input stream won't close
+		while ( [netInStream hasBytesAvailable] ) {
+			length = [netInStream read:buffer maxLength:ROGUE_BUFFER_SIZE];
+			if (length < 1)
+				break;
 		}
 		
-		if (state == RogueStateStreamError) {
-			NSLog(@"Stream error");
-			state = RogueStateShutDown;
-		}
-		
-		if (state == RogueStateShutDown) {
-			[self autorelease];
-			state = RogueStatePostShutdown;
-		}
-		
-		if (state == RogueStatePostShutdown) {
-			// do nothing.  The event will just pass us on by.
-			// At this point, we're waiting for the event loop to empty the autorelease pool, which
-			// will cause deallocation, which in turn will remove the stream events from the run loop.
-		}
-		
-	} while(keepGoing);
+		[self autorelease];
+		state = RogueStatePostShutdown;
+	}
+	
+	if (state == RogueStatePostShutdown) {
+		// do nothing.  The event will just pass us on by.
+		// At this point, we're waiting for the event loop to empty the autorelease pool, which
+		// will cause deallocation, which in turn will remove the stream events from the run loop.
+	}		
 }
 
 /*	Assumes we have a valid request header.
@@ -266,7 +309,8 @@ static NSDictionary *mimeTypes = nil;
 
 	NSString *method = (NSString*) CFHTTPMessageCopyRequestMethod (request);
 	NSURL *url = (NSURL*) CFHTTPMessageCopyRequestURL (request);
-
+	NSLog(@"Stream %p %@ %@", self, method, [url path]);
+	
 	if (! ([method isEqualToString:@"GET"] || [method isEqualToString:@"HEAD"]) ) {
 		responseCode = 405;
 		respText = @"MethodNotSupported";
@@ -276,7 +320,7 @@ static NSDictionary *mimeTypes = nil;
 	}
 	
 	// Find the file corresponding to the URL
-	if (responseCode/200 == 2) {
+	if (responseCode/100 == 2) {
 		BOOL isDir;
 
 		NSArray *searchPaths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -285,10 +329,11 @@ static NSDictionary *mimeTypes = nil;
 		if ([fileManager fileExistsAtPath:filePath isDirectory:&isDir] && isDir)
 			filePath = [filePath stringByAppendingPathComponent:@"index.html"];
 		
-		if ( (fileInStream = [[NSInputStream alloc] initWithFileAtPath:filePath]) ) {
+		if ([fileManager fileExistsAtPath:filePath isDirectory:&isDir] && !isDir) {
+			fileInStream = [[NSInputStream alloc] initWithFileAtPath:filePath];
 			respText = @"OK";
 			contentType = [mimeTypes valueForKey:[filePath pathExtension]];
-			[[[fileManager attributesOfItemAtPath:filePath error:nil] valueForKey:NSFileSize] integerValue];
+			contentLength = [[[fileManager attributesOfItemAtPath:filePath error:nil] valueForKey:NSFileSize] integerValue];
 		} else {
 			responseCode = 404;
 			respText = @"FileNotFound";
@@ -299,7 +344,7 @@ static NSDictionary *mimeTypes = nil;
 	}
 	
 	// Check lastmod date.  (Not Implemented)
-	if (responseCode/200 == 2) {
+	if (responseCode/100 == 2) {
 		NSString *imsDate = (NSString*) CFHTTPMessageCopyHeaderFieldValue(request, (CFStringRef)@"if-modified-since");
 		
 		[imsDate release];
